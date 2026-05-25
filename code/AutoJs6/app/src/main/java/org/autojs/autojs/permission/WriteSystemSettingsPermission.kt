@@ -1,0 +1,22 @@
+package org.autojs.autojs.permission
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import org.autojs.autojs.ui.main.drawer.PermissionItemHelper
+import org.autojs.autojs.util.IntentUtils.startSafely
+
+class WriteSystemSettingsPermission(override val context: Context) : PermissionItemHelper {
+
+    override fun has() = Settings.System.canWrite(context)
+
+    override fun request() = false.also { config() }
+
+    override fun revoke() = false.also { config() }
+
+    fun config() = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
+        .setData(Uri.parse("package:${context.packageName}"))
+        .startSafely(context)
+
+}

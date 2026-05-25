@@ -1,0 +1,506 @@
+package org.autojs.autojs.core.console;
+
+import android.annotation.SuppressLint;
+import android.content.Context;
+import android.content.res.TypedArray;
+import android.graphics.Color;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.method.LinkMovementMethod;
+import android.text.style.ClickableSpan;
+import android.text.style.ForegroundColorSpan;
+import android.util.AttributeSet;
+import android.util.Log;
+import android.util.TypedValue;
+import android.view.LayoutInflater;
+import android.view.ScaleGestureDetector;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.autojs.autojs.theme.ThemeColorHelper;
+import org.autojs.autojs.tool.MapBuilder;
+import org.autojs.autojs.ui.log.LogActivity;
+import org.autojs.autojs.util.DisplayUtils;
+import org.autojs.autojs.util.ViewUtils;
+import org.autojs.autojs6.R;
+
+/**
+ * Created by Stardust on May 2, 2017.
+ * <p>
+ * TODO: 优化为无锁形式
+ */
+public class ConsoleView extends FrameLayout implements ConsoleImpl.LogListener {
+
+    private final static int sRefreshInterval = 100;
+    
+    // Stack frame link pattern: matches "file:line" or "file:line:col" format
+    // Examples: "/sdcard/script.js:10", "script.js:10:5", "file:///path/to/script.js:42:3"
+    private static final Pattern STACK_FRAME_PATTERN = Pattern.compile(
+            "(?:file:)?((?:/[\\S]+?|[^\\s:]+?)\\.js):(\\d+)(?::(\\d+))?"
+    );
+    private static final int LINK_COLOR = 0xFF2196F3; // Blue color for clickable links
+    
+    private boolean mEnableStackFrameLinks = false;
+    private OnStackFrameClickListener mStackFrameClickListener;
+    
+    public interface OnStackFrameClickListener {
+        void onStackFrameClick(String fileName, int lineNumber, int columnNumber);
+    }
+    
+    private final Map<Integer, Integer> mColors = new MapBuilder<Integer, Integer>().build();
+    private ConsoleImpl mConsole;
+    private WeakReference<LogActivity> mLogActivity = null;
+    private RecyclerView mLogListRecyclerView;
+    private boolean mShouldStopRefresh = false;
+    private final ArrayList<ConsoleImpl.LogEntry> mLogEntries = new ArrayList<>();
+
+    private float mLastScaleFactor = 1;
+    private float mLastTextSize = 0;
+
+    private final float mMinTextSize = 8.0f;
+    private final float mMaxTextSize = 56.0f;
+    private boolean mIsPinchToZoomEnabled;
+
+    public ConsoleView(Context context) {
+        super(context);
+        init(null, 0);
+    }
+
+    public ConsoleView(Context context, @Nullable AttributeSet attrs) {
+        super(context, attrs);
+        init(attrs, 0);
+    }
+
+    public ConsoleView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
+        super(context, attrs, defStyleAttr);
+        init(attrs, defStyleAttr);
+    }
+
+    public Map<Integer, Integer> getTextColors() {
+        return mColors;
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void init(@Nullable AttributeSet attrs, int defStyleAttr) {
+        inflate(getContext(), R.layout.console_view, this);
+
+        Map<Integer, Integer> logLevelColorResIdMap = getLogLevelMap();
+        Map<Integer, Integer> logLevelColorIntMap = getLogLevelMap();
+
+        boolean isExcludeFromNavigationBar = false;
+
+        if (attrs != null) {
+            TypedArray ta = getContext().obtainStyledAttributes(attrs, R.styleable.ConsoleView, defStyleAttr, 0);
+
+            logLevelColorIntMap.put(Log.VERBOSE, ta.getColor(R.styleable.ConsoleView_color_verbose, Color.TRANSPARENT));
+            logLevelColorIntMap.put(Log.DEBUG, ta.getColor(R.styleable.ConsoleView_color_debug, Color.TRANSPARENT));
+            logLevelColorIntMap.put(Log.INFO, ta.getColor(R.styleable.ConsoleView_color_info, Color.TRANSPARENT));
+            logLevelColorIntMap.put(Log.WARN, ta.getColor(R.styleable.ConsoleView_color_warn, Color.TRANSPARENT));
+            logLevelColorIntMap.put(Log.ERROR, ta.getColor(R.styleable.ConsoleView_color_error, Color.TRANSPARENT));
+            logLevelColorIntMap.put(Log.ASSERT, ta.getColor(R.styleable.ConsoleView_color_assert, Color.TRANSPARENT));
+
+            isExcludeFromNavigationBar = ta.getBoolean(R.styleable.ConsoleView_excludeFromNavigationBar, false);
+
+            ta.recycle();
+        }
+
+        for (Map.Entry<Integer, Integer> map : logLevelColorResIdMap.entrySet()) {
+            int logLevel = map.getKey();
+            int colorResKey = map.getValue();
+            mColors.put(logLevel, getContext().getColor(colorResKey));
+        }
+
+        for (Map.Entry<Integer, Integer> map : logLevelColorIntMap.entrySet()) {
+            int logLevel = map.getKey();
+            int colorInt = map.getValue();
+            if (colorInt != Color.TRANSPARENT) {
+                mColors.put(logLevel, colorInt);
+            }
+        }
+
+        ScaleGestureDetector mScaleGestureDetector = new ScaleGestureDetector(getContext(), getSimpleOnScaleGestureListener());
+
+        mLogListRecyclerView = findViewById(R.id.log_list);
+        mLogListRecyclerView.setLayoutManager(new LinearLayoutManager(getContext()));
+        mLogListRecyclerView.setAdapter(new Adapter());
+
+        mLogListRecyclerView.setOnTouchListener((v, event) -> {
+            if (!mIsPinchToZoomEnabled) {
+                return super.onTouchEvent(event);
+            }
+            mScaleGestureDetector.onTouchEvent(event);
+            return !mScaleGestureDetector.isInProgress() && super.onTouchEvent(event);
+        });
+
+        if (isExcludeFromNavigationBar) {
+            ViewUtils.excludePaddingClippableViewFromBottomNavigationBar(mLogListRecyclerView);
+        }
+    }
+
+    @NonNull
+    private ScaleGestureDetector.SimpleOnScaleGestureListener getSimpleOnScaleGestureListener() {
+        return new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScale(@NonNull ScaleGestureDetector detector) {
+                float currentFactor = (float) (Math.floor(detector.getScaleFactor() * 10) / 10);
+                if (mLastTextSize <= 0) {
+                    mLastTextSize = getTextSize();
+                }
+                if (currentFactor > 0 && mLastScaleFactor != currentFactor) {
+                    float currentTextSize = mLastTextSize + (currentFactor > mLastScaleFactor ? 1 : -1);
+                    mLastTextSize = Math.max(mMinTextSize, Math.min(mMaxTextSize, currentTextSize));
+                    setTextSize(mLastTextSize);
+
+                    mLastScaleFactor = currentFactor;
+                }
+                return super.onScale(detector);
+            }
+
+            @Override
+            public boolean onScaleBegin(@NonNull ScaleGestureDetector detector) {
+                return super.onScaleBegin(detector);
+            }
+
+            @Override
+            public void onScaleEnd(@NonNull ScaleGestureDetector detector) {
+                mLastScaleFactor = 1.0f;
+                super.onScaleEnd(detector);
+            }
+        };
+    }
+
+    public void setTextSize(float size) {
+        mLastTextSize = size;
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setTextSize(size);
+        }
+    }
+
+    public float getTextSize() {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            return adapter.getTextSize();
+        }
+        return /* default text size */ 14;
+    }
+
+    public void setTextColors(Integer[] colors) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setTextColors(colors);
+        }
+    }
+
+    public void setVerboseTextColor(int color) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setVerboseTextColor(color);
+        }
+    }
+
+    public void setDebugTextColor(int color) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setDebugTextColor(color);
+        }
+    }
+
+    public void setInfoTextColor(int color) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setInfoTextColor(color);
+        }
+    }
+
+    public void setWarnTextColor(int color) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setWarnTextColor(color);
+        }
+    }
+
+    public void setErrorTextColor(int color) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setErrorTextColor(color);
+        }
+    }
+
+    public void setAssertTextColor(int color) {
+        Adapter adapter = (Adapter) mLogListRecyclerView.getAdapter();
+        if (adapter != null) {
+            adapter.setAssertTextColor(color);
+        }
+    }
+
+    public void setPinchToZoomEnabled(boolean enabled) {
+        mIsPinchToZoomEnabled = enabled;
+    }
+
+    /**
+     * Enable or disable clickable stack frame links in log entries
+     * @param enabled true to enable, false to disable
+     */
+    public void setEnableStackFrameLinks(boolean enabled) {
+        mEnableStackFrameLinks = enabled;
+    }
+
+    /**
+     * Set the listener for stack frame click events
+     * @param listener the listener to receive click events
+     */
+    public void setOnStackFrameClickListener(OnStackFrameClickListener listener) {
+        mStackFrameClickListener = listener;
+    }
+
+    /**
+     * Parse log content and create clickable spans for stack frames
+     * @param content the original log content
+     * @param baseColor the base text color
+     * @return CharSequence with clickable spans for stack frames
+     */
+    private CharSequence createClickableContent(CharSequence content, int baseColor) {
+        if (!mEnableStackFrameLinks) {
+            return content;
+        }
+        
+        String text = content.toString();
+        SpannableString spannable = new SpannableString(text);
+        
+        Matcher matcher = STACK_FRAME_PATTERN.matcher(text);
+        boolean hasLinks = false;
+        
+        while (matcher.find()) {
+            hasLinks = true;
+            final String fileName = matcher.group(1);
+            final int lineNumber = Integer.parseInt(matcher.group(2));
+            final int columnNumber = matcher.group(3) != null ? Integer.parseInt(matcher.group(3)) : 0;
+            
+            final int start = matcher.start();
+            final int end = matcher.end();
+            
+            ClickableSpan clickableSpan = new ClickableSpan() {
+                @Override
+                public void onClick(@NonNull View widget) {
+                    if (mStackFrameClickListener != null) {
+                        mStackFrameClickListener.onStackFrameClick(fileName, lineNumber - 1, columnNumber);
+                    }
+                }
+            };
+            
+            spannable.setSpan(clickableSpan, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            
+            ForegroundColorSpan colorSpan = new ForegroundColorSpan(LINK_COLOR);
+            spannable.setSpan(colorSpan, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        
+        return hasLinks ? spannable : content;
+    }
+
+    protected Map<Integer, Integer> getLogLevelMap() {
+        return new MapBuilder<Integer, Integer>()
+                .put(Log.VERBOSE, R.color.console_view_verbose)
+                .put(Log.DEBUG, R.color.console_view_debug)
+                .put(Log.INFO, R.color.console_view_info)
+                .put(Log.WARN, R.color.console_view_warn)
+                .put(Log.ERROR, R.color.console_view_error)
+                .put(Log.ASSERT, R.color.console_view_assert)
+                .build();
+    }
+
+    public void setConsole(ConsoleImpl console) {
+        mConsole = console;
+        mConsole.setConsoleView(this);
+    }
+
+    public void setLogActivity(LogActivity activity) {
+        mLogActivity = new WeakReference<>(activity);
+    }
+
+    public void export(String fileName) {
+        if (mLogActivity != null) {
+            LogActivity logActivityRef = mLogActivity.get();
+            if (logActivityRef != null) {
+                logActivityRef.export(fileName);
+            }
+        }
+    }
+
+    @Override
+    public void onNewLog(ConsoleImpl.LogEntry logEntry) {
+        /* Empty body. */
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        mShouldStopRefresh = false;
+        postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                refreshLog();
+                if (!mShouldStopRefresh) {
+                    postDelayed(this, sRefreshInterval);
+                }
+            }
+        }, sRefreshInterval);
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        super.onDetachedFromWindow();
+        mShouldStopRefresh = true;
+    }
+
+    @Override
+    public void onLogClear() {
+        post(() -> {
+            mLogEntries.clear();
+            Objects.requireNonNull(mLogListRecyclerView.getAdapter()).notifyDataSetChanged();
+        });
+    }
+
+    private void refreshLog() {
+        if (mConsole == null)
+            return;
+        int oldSize = mLogEntries.size();
+        ArrayList<ConsoleImpl.LogEntry> logEntries = mConsole.getLogEntries();
+        synchronized (mConsole.getLogEntries()) {
+            final int size = logEntries.size();
+            if (size == 0) {
+                return;
+            }
+            if (oldSize >= size) {
+                return;
+            }
+            if (oldSize == 0) {
+                mLogEntries.addAll(logEntries);
+            } else {
+                for (int i = oldSize; i < size; i++) {
+                    mLogEntries.add(logEntries.get(i));
+                }
+            }
+            Objects.requireNonNull(mLogListRecyclerView.getAdapter()).notifyItemRangeInserted(oldSize, size - 1);
+            mLogListRecyclerView.scrollToPosition(size - 1);
+        }
+    }
+
+    private class ViewHolder extends RecyclerView.ViewHolder {
+
+        TextView textView;
+
+        public ViewHolder(View itemView) {
+            super(itemView);
+            textView = (TextView) itemView;
+            textView.setMovementMethod(LinkMovementMethod.getInstance());
+        }
+
+    }
+
+    private class Adapter extends RecyclerView.Adapter<ViewHolder> {
+
+        private float textSize;
+
+        @NonNull
+        @Override
+        public ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            return new ViewHolder(LayoutInflater.from(getContext()).inflate(R.layout.console_view_item, parent, false));
+        }
+
+        @Override
+        public void onBindViewHolder(ViewHolder holder, int position) {
+            TextView textView = holder.textView;
+            ConsoleImpl.LogEntry logEntry = mLogEntries.get(position);
+            
+            Integer color = mColors.get(logEntry.level);
+            if (color != null) {
+                // Create clickable content with stack frame links
+                CharSequence content = createClickableContent(logEntry.content, color);
+                textView.setText(content);
+                textView.setTextColor(color);
+            } else {
+                textView.setText(logEntry.content);
+            }
+            
+            ThemeColorHelper.setThemeColorPrimary(textView, true);
+            if (textSize > 0) {
+                textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, textSize);
+            } else {
+                textSize = DisplayUtils.pxToSp(textView.getTextSize());
+            }
+        }
+
+        public void setTextSize(float size) {
+            textSize = size;
+            notifyDataSetChanged();
+        }
+
+        public float getTextSize() {
+            return textSize;
+        }
+
+        public void setTextColors(Integer[] colors) {
+            int[] levels = new int[]{Log.VERBOSE, Log.DEBUG, Log.INFO, Log.WARN, Log.ERROR, Log.ASSERT};
+            boolean isReplaced = false;
+            for (int i = 0; i < colors.length; i++) {
+                if (colors[i] != null) {
+                    mColors.replace(levels[i], colors[i]);
+                    isReplaced = true;
+                }
+            }
+            if (isReplaced) {
+                notifyDataSetChanged();
+            }
+        }
+
+        public void setVerboseTextColor(int color) {
+            mColors.replace(Log.VERBOSE, color);
+            notifyDataSetChanged();
+        }
+
+        public void setDebugTextColor(int color) {
+            mColors.replace(Log.DEBUG, color);
+            notifyDataSetChanged();
+        }
+
+        public void setInfoTextColor(int color) {
+            mColors.replace(Log.INFO, color);
+            notifyDataSetChanged();
+        }
+
+        public void setWarnTextColor(int color) {
+            mColors.replace(Log.WARN, color);
+            notifyDataSetChanged();
+        }
+
+        public void setErrorTextColor(int color) {
+            mColors.replace(Log.ERROR, color);
+            notifyDataSetChanged();
+        }
+
+        public void setAssertTextColor(int color) {
+            mColors.replace(Log.ASSERT, color);
+            notifyDataSetChanged();
+        }
+
+        @Override
+        public int getItemCount() {
+            return mLogEntries.size();
+        }
+    }
+
+}

@@ -1,0 +1,15 @@
+/out
+/node_modules
+/.git
+/.vscode
+/.vscode-test
+/.idea
+
+/*.js
+
+*.vsix
+*.bak
+token.txt
+package-lock.json
+sync.ffs_db
+debug.log
